@@ -1,0 +1,239 @@
+import asyncio
+import logging
+import aiosqlite
+import random
+from datetime import datetime, date, timedelta
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+
+# --- НАСТРОЙКИ (ОБЯЗАТЕЛЬНО ЗАПОЛНИ) ---
+API_TOKEN = '8605483965:AAHExXC7Yyd8U5ke0g5g-LRGG_tAnBteZ1E'
+ADMIN_ID = 8032626504  # Твой числовой ID (узнай в @userinfobot)
+DB_PATH = 'bot_database.db'
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher()
+
+# --- СОСТОЯНИЯ ---
+class States(StatesGroup):
+    uploading = State()      # Массовая загрузка
+    suggesting = State()     # Предложка
+    promo_create = State()   # Создание промо (админ)
+    promo_activate = State() # Активация промо (юзер)
+
+# --- БАЗА ДАННЫХ ---
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''CREATE TABLE IF NOT EXISTS users 
+            (user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 5, 
+            premium_until TEXT, last_bonus TEXT, referrer_id INTEGER)''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS content 
+            (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, file_id TEXT)''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS promos 
+            (code TEXT PRIMARY KEY, reward INTEGER, uses INTEGER)''')
+        await db.commit()
+
+# --- КЛАВИАТУРЫ ---
+def main_menu(user_id):
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="🎬 Видео (2 💎)")
+    kb.button(text="🖼 Фото (1 💎)")
+    kb.button(text="👤 Профиль")
+    kb.button(text="🎁 Бонус")
+    kb.button(text="🤝 Рефералы")
+    kb.button(text="🎫 Промокод")
+    kb.button(text="💡 Предложить")
+    kb.button(text="🆘 Поддержка")
+    if user_id == ADMIN_ID:
+        kb.button(text="🛠 Админка")
+    kb.adjust(2)
+    return kb.as_markup(resize_keyboard=True)
+
+# --- ЛОГИКА ЮЗЕРА ---
+
+@dp.message(CommandStart())
+async def start(message: types.Message):
+    args = message.text.split()
+    ref_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (message.from_user.id,)) as c:
+            if not await c.fetchone():
+                await db.execute("INSERT INTO users (user_id, referrer_id) VALUES (?, ?)", (message.from_user.id, ref_id))
+                if ref_id:
+                    await db.execute("UPDATE users SET balance = balance + 3 WHERE user_id = ?", (ref_id,))
+                    try: await bot.send_message(ref_id, "🤝 По вашей ссылке зашел новый юзер! +3 💎")
+                    except: pass
+                await db.commit()
+    await message.answer("👋 Добро пожаловать!", reply_markup=main_menu(message.from_user.id))
+
+@dp.message(F.text == "👤 Профиль")
+async def profile(message: types.Message):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT balance, premium_until FROM users WHERE user_id = ?", (message.from_user.id,)) as c:
+            res = await c.fetchone()
+            bal, prem = res[0], res[1]
+            is_prem = prem and datetime.fromisoformat(prem) > datetime.now()
+            status = f"🌟 Премиум до {prem}" if is_prem else "Обычный"
+            await message.answer(f"👤 **Профиль**\n\n💰 Баланс: {bal} 💎\n👑 Статус: {status}", parse_mode="Markdown")
+
+@dp.message(F.text == "🎁 Бонус")
+async def daily_bonus(message: types.Message):
+    today = str(date.today())
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT last_bonus, premium_until FROM users WHERE user_id = ?", (message.from_user.id,)) as c:
+            res = await c.fetchone()
+            if res[0] == today:
+                return await message.answer("❌ Бонус уже получен! Приходи завтра.")
+            
+            is_prem = res[1] and datetime.fromisoformat(res[1]) > datetime.now()
+            reward = 15 if is_prem else 5
+            await db.execute("UPDATE users SET balance = balance + ?, last_bonus = ? WHERE user_id = ?", (reward, today, message.from_user.id))
+            await db.commit()
+            await message.answer(f"✅ Получено {reward} 💎!")
+
+@dp.message(F.text == "🤝 Рефералы")
+async def referral(message: types.Message):
+    link = f"https://t.me/{(await bot.get_me()).username}?start={message.from_user.id}"
+    await message.answer(f"🔗 Твоя ссылка:\n{link}\n\nЗа каждого друга даем 3 💎")
+
+# --- ПРОСМОТР КОНТЕНТА ---
+@dp.message(F.text.in_({"🎬 Видео (2 💎)", "🖼 Фото (1 💎)"}))
+async def view(message: types.Message):
+    c_type = "video" if "Видео" in message.text else "photo"
+    cost = 2 if c_type == "video" else 1
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT balance FROM users WHERE user_id = ?", (message.from_user.id,)) as c:
+            bal = (await c.fetchone())[0]
+            if bal < cost: return await message.answer("⚠️ Недостаточно алмазиков!")
+            
+        async with db.execute("SELECT file_id FROM content WHERE type = ? ORDER BY RANDOM() LIMIT 1", (c_type,)) as c:
+            item = await c.fetchone()
+            if not item: return await message.answer("Контента пока нет.")
+            
+            await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (cost, message.from_user.id))
+            await db.commit()
+            if c_type == "video": await message.answer_video(item[0])
+            else: await message.answer_photo(item[0])
+
+# --- ПРЕДЛОЖКА ---
+@dp.message(F.text == "💡 Предложить")
+async def suggest_start(message: types.Message, state: FSMContext):
+    await state.set_state(States.suggesting)
+    await message.answer("Пришли фото или видео для предложки:")
+
+@dp.message(States.suggesting)
+async def suggest_proc(message: types.Message, state: FSMContext):
+    if not (message.photo or message.video):
+        return await message.answer("Скинь медиафайл!")
+    
+    btn = InlineKeyboardBuilder()
+    btn.button(text="✅ Принять", callback_data=f"app_{message.from_user.id}")
+    btn.button(text="❌ Отклонить", callback_data="rej")
+    
+    await bot.send_message(ADMIN_ID, f"💡 Предложка от {message.from_user.id}:")
+    if message.photo: await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, reply_markup=btn.as_markup())
+    else: await bot.send_video(ADMIN_ID, message.video.file_id, reply_markup=btn.as_markup())
+    
+    await state.clear()
+    await message.answer("🚀 Отправлено на модерацию!")
+
+@dp.callback_query(F.data.startswith("app_"))
+async def approve(call: types.CallbackQuery):
+    uid = int(call.data.split("_")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET balance = balance + 5 WHERE user_id = ?", (uid,))
+        await db.commit()
+    await bot.send_message(uid, "🎉 Ваше предложение принято! +5 💎")
+    await call.message.edit_caption(caption="✅ Одобрено")
+
+# --- АДМИНКА ---
+@dp.message(F.text == "🛠 Админка", F.from_user.id == ADMIN_ID)
+async def admin_main(message: types.Message):
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="📥 Загрузить")
+    kb.button(text="🎫 Создать промо")
+    kb.button(text="🔙 Назад")
+    await message.answer("Меню админа:", reply_markup=kb.as_markup(resize_keyboard=True))
+
+@dp.message(F.text == "📥 Загрузить", F.from_user.id == ADMIN_ID)
+async def upload_mode(message: types.Message, state: FSMContext):
+    await state.set_state(States.uploading)
+    await message.answer("Режим загрузки! Шли файлы. Когда всё — жми /done", reply_markup=types.ReplyKeyboardRemove())
+
+@dp.message(States.uploading)
+async def mass_upload(message: types.Message, state: FSMContext):
+    if message.text == "/done":
+        await state.clear()
+        return await admin_main(message)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        if message.photo:
+            await db.execute("INSERT INTO content (type, file_id) VALUES (?, ?)", ("photo", message.photo[-1].file_id))
+            await message.answer("📸 +1 фото")
+        elif message.video:
+            await db.execute("INSERT INTO content (type, file_id) VALUES (?, ?)", ("video", message.video.file_id))
+            await message.answer("🎥 +1 видео")
+        await db.commit()
+
+# --- ПОДДЕРЖКА ---
+@dp.message(F.text == "🆘 Поддержка")
+async def support(message: types.Message):
+    await message.answer("Напиши свой вопрос админу:")
+
+@dp.message(F.from_user.id != ADMIN_ID, ~F.text.startswith("/"))
+async def support_forward(message: types.Message):
+    await bot.send_message(ADMIN_ID, f"📩 Сообщение от `{message.from_user.id}`:\n{message.text}\n\nОтвет: `/reply {message.from_user.id} текст`", parse_mode="Markdown")
+
+@dp.message(Command("reply"), F.from_user.id == ADMIN_ID)
+async def reply_handler(message: types.Message):
+    parts = message.text.split(maxsplit=2)
+    if len(parts) == 3:
+        await bot.send_message(parts[1], f"✉️ Ответ от поддержки:\n{parts[2]}")
+        await message.answer("Отправлено!")
+
+# --- ПРОМОКОДЫ ---
+@dp.message(F.text == "🎫 Промокод")
+async def promo_start(message: types.Message, state: FSMContext):
+    await state.set_state(States.promo_activate)
+    await message.answer("Введите промокод:")
+
+@dp.message(States.promo_activate)
+async def promo_act(message: types.Message, state: FSMContext):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT reward, uses FROM promos WHERE code = ?", (message.text,)) as c:
+            row = await c.fetchone()
+            if row and row[1] > 0:
+                await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (row[0], message.from_user.id))
+                await db.execute("UPDATE promos SET uses = uses - 1 WHERE code = ?", (message.text,))
+                await db.commit()
+                await message.answer(f"✅ Активировано! +{row[0]} 💎")
+            else:
+                await message.answer("❌ Неверный код или лимит исчерпан.")
+    await state.clear()
+
+# --- КОМАНДЫ ДЛЯ ПРЕМИУМА ---
+@dp.message(Command("setprem"), F.from_user.id == ADMIN_ID)
+async def set_prem(message: types.Message):
+    # Формат: /setprem 12345678 30 (ID и кол-во дней)
+    p = message.text.split()
+    if len(p) == 3:
+        date_limit = (datetime.now() + timedelta(days=int(p[2]))).isoformat()
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET premium_until = ? WHERE user_id = ?", (date_limit, p[1]))
+            await db.commit()
+        await message.answer("✅ Премиум выдан!")
+        await bot.send_message(p[1], f"👑 Вам выдан Премиум на {p[2]} дней!")
+
+# --- СТАРТ ---
+async def main():
+    await init_db()
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
